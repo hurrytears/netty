@@ -42,7 +42,7 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
     private static final int DEFAULT_NUM_DIRECT_ARENA;
 
     private static final int DEFAULT_PAGE_SIZE;
-    private static final int DEFAULT_MAX_ORDER; // 8192 << 11 = 16 MiB per chunk
+    private static final int DEFAULT_MAX_ORDER; // 8192 << 9 = 4 MiB per chunk
     private static final int DEFAULT_SMALL_CACHE_SIZE;
     private static final int DEFAULT_NORMAL_CACHE_SIZE;
     static final int DEFAULT_MAX_CACHED_BUFFER_CAPACITY;
@@ -77,7 +77,7 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
         DEFAULT_PAGE_SIZE = defaultPageSize;
         DEFAULT_DIRECT_MEMORY_CACHE_ALIGNMENT = defaultAlignment;
 
-        int defaultMaxOrder = SystemPropertyUtil.getInt("io.netty.allocator.maxOrder", 11);
+        int defaultMaxOrder = SystemPropertyUtil.getInt("io.netty.allocator.maxOrder", 9);
         Throwable maxOrderFallbackCause = null;
         try {
             validateAndCalculateChunkSize(DEFAULT_PAGE_SIZE, defaultMaxOrder);
@@ -144,7 +144,7 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
         }
 
         DEFAULT_USE_CACHE_FOR_ALL_THREADS = SystemPropertyUtil.getBoolean(
-                "io.netty.allocator.useCacheForAllThreads", true);
+                "io.netty.allocator.useCacheForAllThreads", false);
 
         // Use 1023 by default as we use an ArrayDeque as backing storage which will then allocate an internal array
         // of 1024 elements. Otherwise we would allocate 2048 and only use 1024 which is wasteful.
@@ -300,8 +300,7 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
             List<PoolArenaMetric> metrics = new ArrayList<PoolArenaMetric>(heapArenas.length);
             for (int i = 0; i < heapArenas.length; i ++) {
                 PoolArena.HeapArena arena = new PoolArena.HeapArena(this,
-                        pageSize, pageShifts, chunkSize,
-                        directMemoryCacheAlignment);
+                        pageSize, pageShifts, chunkSize);
                 heapArenas[i] = arena;
                 metrics.add(arena);
             }
@@ -424,14 +423,14 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
     }
 
     /**
-     * Default maximum order - System Property: io.netty.allocator.maxOrder - default 11
+     * Default maximum order - System Property: io.netty.allocator.maxOrder - default 9
      */
     public static int defaultMaxOrder() {
         return DEFAULT_MAX_ORDER;
     }
 
     /**
-     * Default thread caching behavior - System Property: io.netty.allocator.useCacheForAllThreads - default true
+     * Default thread caching behavior - System Property: io.netty.allocator.useCacheForAllThreads - default false
      */
     public static boolean defaultUseCacheForAllThreads() {
         return DEFAULT_USE_CACHE_FOR_ALL_THREADS;
@@ -481,6 +480,7 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
     }
 
     /**
+     * @deprecated will be removed
      * Returns {@code true} if the calling {@link Thread} has a {@link ThreadLocal} cache for the allocated
      * buffers.
      */
@@ -490,6 +490,7 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
     }
 
     /**
+     * @deprecated will be removed
      * Free all cached buffers for the calling {@link Thread}.
      */
     @Deprecated
@@ -497,7 +498,7 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
         threadCache.remove();
     }
 
-    final class PoolThreadLocalCache extends FastThreadLocal<PoolThreadCache> {
+    private final class PoolThreadLocalCache extends FastThreadLocal<PoolThreadCache> {
         private final boolean useCacheForAllThreads;
 
         PoolThreadLocalCache(boolean useCacheForAllThreads) {
@@ -510,13 +511,19 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
             final PoolArena<ByteBuffer> directArena = leastUsedArena(directArenas);
 
             final Thread current = Thread.currentThread();
-            if (useCacheForAllThreads || current instanceof FastThreadLocalThread) {
+            final EventExecutor executor = ThreadExecutorMap.currentExecutor();
+
+            if (useCacheForAllThreads ||
+                    // If the current thread is a FastThreadLocalThread we will always use the cache
+                    current instanceof FastThreadLocalThread ||
+                    // The Thread is used by an EventExecutor, let's use the cache as the chances are good that we
+                    // will allocate a lot!
+                    executor != null) {
                 final PoolThreadCache cache = new PoolThreadCache(
                         heapArena, directArena, smallCacheSize, normalCacheSize,
                         DEFAULT_MAX_CACHED_BUFFER_CAPACITY, DEFAULT_CACHE_TRIM_INTERVAL);
 
                 if (DEFAULT_CACHE_TRIM_INTERVAL_MILLIS > 0) {
-                    final EventExecutor executor = ThreadExecutorMap.currentExecutor();
                     if (executor != null) {
                         executor.scheduleAtFixedRate(trimTask, DEFAULT_CACHE_TRIM_INTERVAL_MILLIS,
                                 DEFAULT_CACHE_TRIM_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
@@ -670,6 +677,40 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
         long used = 0;
         for (PoolArena<?> arena : arenas) {
             used += arena.numActiveBytes();
+            if (used < 0) {
+                return Long.MAX_VALUE;
+            }
+        }
+        return used;
+    }
+
+    /**
+     * Returns the number of bytes of heap memory that is currently pinned to heap buffers allocated by a
+     * {@link ByteBufAllocator}, or {@code -1} if unknown.
+     * A buffer can pin more memory than its {@linkplain ByteBuf#capacity() capacity} might indicate,
+     * due to implementation details of the allocator.
+     */
+    public final long pinnedHeapMemory() {
+        return pinnedMemory(heapArenas);
+    }
+
+    /**
+     * Returns the number of bytes of direct memory that is currently pinned to direct buffers allocated by a
+     * {@link ByteBufAllocator}, or {@code -1} if unknown.
+     * A buffer can pin more memory than its {@linkplain ByteBuf#capacity() capacity} might indicate,
+     * due to implementation details of the allocator.
+     */
+    public final long pinnedDirectMemory() {
+        return pinnedMemory(directArenas);
+    }
+
+    private static long pinnedMemory(PoolArena<?>[] arenas) {
+        if (arenas == null) {
+            return -1;
+        }
+        long used = 0;
+        for (PoolArena<?> arena : arenas) {
+            used += arena.numPinnedBytes();
             if (used < 0) {
                 return Long.MAX_VALUE;
             }

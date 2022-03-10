@@ -89,7 +89,7 @@ public final class PlatformDependent {
 
     private static final Throwable UNSAFE_UNAVAILABILITY_CAUSE = unsafeUnavailabilityCause0();
     private static final boolean DIRECT_BUFFER_PREFERRED;
-    private static final long MAX_DIRECT_MEMORY = maxDirectMemory0();
+    private static final long MAX_DIRECT_MEMORY = estimateMaxDirectMemory();
 
     private static final int MPSC_CHUNK_SIZE =  1024;
     private static final int MIN_MAX_MPSC_CAPACITY =  MPSC_CHUNK_SIZE * 2;
@@ -974,8 +974,12 @@ public final class PlatformDependent {
             // This is forced by the MpscChunkedArrayQueue implementation as will try to round it
             // up to the next power of two and so will overflow otherwise.
             final int capacity = max(min(maxCapacity, MAX_ALLOWED_MPSC_CAPACITY), MIN_MAX_MPSC_CAPACITY);
-            return USE_MPSC_CHUNKED_ARRAY_QUEUE ? new MpscChunkedArrayQueue<T>(MPSC_CHUNK_SIZE, capacity)
-                                                : new MpscChunkedAtomicArrayQueue<T>(MPSC_CHUNK_SIZE, capacity);
+            return newChunkedMpscQueue(MPSC_CHUNK_SIZE, capacity);
+        }
+
+        static <T> Queue<T> newChunkedMpscQueue(final int chunkSize, final int capacity) {
+            return USE_MPSC_CHUNKED_ARRAY_QUEUE ? new MpscChunkedArrayQueue<T>(chunkSize, capacity)
+                    : new MpscChunkedAtomicArrayQueue<T>(chunkSize, capacity);
         }
 
         static <T> Queue<T> newMpscQueue() {
@@ -999,6 +1003,15 @@ public final class PlatformDependent {
      */
     public static <T> Queue<T> newMpscQueue(final int maxCapacity) {
         return Mpsc.newMpscQueue(maxCapacity);
+    }
+
+    /**
+     * Create a new {@link Queue} which is safe to use for multiple producers (different threads) and a single
+     * consumer (one thread!).
+     * The queue will grow and shrink its capacity in units of the given chunk size.
+     */
+    public static <T> Queue<T> newMpscQueue(final int chunkSize, final int maxCapacity) {
+        return Mpsc.newChunkedMpscQueue(chunkSize, maxCapacity);
     }
 
     /**
@@ -1134,7 +1147,16 @@ public final class PlatformDependent {
         return vmName.equals("IKVM.NET");
     }
 
-    private static long maxDirectMemory0() {
+    /**
+     * Compute an estimate of the maximum amount of direct memory available to this JVM.
+     * <p>
+     * The computation is not cached, so you probably want to use {@link #maxDirectMemory()} instead.
+     * <p>
+     * This will produce debug log output when called.
+     *
+     * @return The estimated max direct memory, in bytes.
+     */
+    public static long estimateMaxDirectMemory() {
         long maxDirectMemory = 0;
 
         ClassLoader systemClassLoader = null;

@@ -84,7 +84,10 @@ class Hidden {
                     "io.netty.handler.ssl.SslHandler",
                     "runAllDelegatedTasks"
             );
-
+            builder.allowBlockingCallsInside(
+                    "io.netty.handler.ssl.SslHandler",
+                    "runDelegatedTasks"
+            );
             builder.allowBlockingCallsInside(
                     "io.netty.util.concurrent.GlobalEventExecutor",
                     "takeTask");
@@ -128,8 +131,12 @@ class Hidden {
                     "parseEtcResolverOptions");
 
             builder.allowBlockingCallsInside(
-                    "io.netty.resolver.HostsFileParser",
+                    "io.netty.resolver.HostsFileEntriesProvider$ParserImpl",
                     "parse");
+
+            builder.allowBlockingCallsInside(
+                    "io.netty.util.NetUil$SoMaxConnAction",
+                    "run");
 
             builder.nonBlockingThreadPredicate(new Function<Predicate<Thread>, Predicate<Thread>>() {
                 @Override

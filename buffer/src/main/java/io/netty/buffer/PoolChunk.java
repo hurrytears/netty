@@ -15,6 +15,9 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.internal.LongCounter;
+import io.netty.util.internal.PlatformDependent;
+
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -159,6 +162,11 @@ final class PoolChunk<T> implements PoolChunkMetric {
      * manage all subpages in this chunk
      */
     private final PoolSubpage<T>[] subpages;
+
+    /**
+     * Accounting of pinned memory – memory that is currently in use by ByteBuf instances.
+     */
+    private final LongCounter pinnedBytes = PlatformDependent.newLongCounter();
 
     private final int pageSize;
     private final int pageShifts;
@@ -309,6 +317,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
             if (handle < 0) {
                 return false;
             }
+            assert !isSubpage(handle);
         }
 
         ByteBuffer nioBuffer = cachedNioBuffers != null? cachedNioBuffers.pollLast() : null;
@@ -339,7 +348,8 @@ final class PoolChunk<T> implements PoolChunkMetric {
                 handle = splitLargeRun(handle, pages);
             }
 
-            freeBytes -= runSize(pageShifts, handle);
+            int pinnedSize = runSize(pageShifts, handle);
+            freeBytes -= pinnedSize;
             return handle;
         }
     }
@@ -448,6 +458,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
      * @param handle handle to free
      */
     void free(long handle, int normCapacity, ByteBuffer nioBuffer) {
+        int runSize = runSize(pageShifts, handle);
         if (isSubpage(handle)) {
             int sizeIdx = arena.size2SizeIdx(normCapacity);
             PoolSubpage<T> head = arena.findSubpagePoolHead(sizeIdx);
@@ -470,8 +481,6 @@ final class PoolChunk<T> implements PoolChunkMetric {
         }
 
         //start free run
-        int pages = runPages(handle);
-
         synchronized (runsAvail) {
             // collapse continuous runs, successfully collapsed runs
             // will be removed from runsAvail and runsAvailMap
@@ -483,7 +492,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
             finalRun &= ~(1L << IS_SUBPAGE_SHIFT);
 
             insertAvailRun(runOffset(finalRun), runPages(finalRun), finalRun);
-            freeBytes += pages << pageShifts;
+            freeBytes += runSize;
         }
 
         if (nioBuffer != null && cachedNioBuffers != null &&
@@ -552,11 +561,12 @@ final class PoolChunk<T> implements PoolChunkMetric {
 
     void initBuf(PooledByteBuf<T> buf, ByteBuffer nioBuffer, long handle, int reqCapacity,
                  PoolThreadCache threadCache) {
-        if (isRun(handle)) {
-            buf.init(this, nioBuffer, handle, runOffset(handle) << pageShifts,
-                     reqCapacity, runSize(pageShifts, handle), arena.parent.threadCache());
-        } else {
+        if (isSubpage(handle)) {
             initBufWithSubpage(buf, nioBuffer, handle, reqCapacity, threadCache);
+        } else {
+            int maxLength = runSize(pageShifts, handle);
+            buf.init(this, nioBuffer, handle, runOffset(handle) << pageShifts,
+                    reqCapacity, maxLength, arena.parent.threadCache());
         }
     }
 
@@ -567,10 +577,20 @@ final class PoolChunk<T> implements PoolChunkMetric {
 
         PoolSubpage<T> s = subpages[runOffset];
         assert s.doNotDestroy;
-        assert reqCapacity <= s.elemSize;
+        assert reqCapacity <= s.elemSize : reqCapacity + "<=" + s.elemSize;
 
         int offset = (runOffset << pageShifts) + bitmapIdx * s.elemSize;
         buf.init(this, nioBuffer, handle, offset, reqCapacity, s.elemSize, threadCache);
+    }
+
+    void incrementPinnedMemory(int delta) {
+        assert delta > 0;
+        pinnedBytes.add(delta);
+    }
+
+    void decrementPinnedMemory(int delta) {
+        assert delta > 0;
+        pinnedBytes.add(-delta);
     }
 
     @Override
@@ -583,6 +603,10 @@ final class PoolChunk<T> implements PoolChunkMetric {
         synchronized (arena) {
             return freeBytes;
         }
+    }
+
+    public int pinnedBytes() {
+        return (int) pinnedBytes.value();
     }
 
     @Override
